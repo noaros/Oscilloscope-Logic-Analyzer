@@ -11,6 +11,8 @@ These exercises use four tools together:
 
 The idea running through all of them: **the generator is a reference you trust, the scope tells you what a signal is, the logic analyzer tells you what a digital circuit thinks it is, and the microcontroller is the thing you are trying to understand.** Most of what you learn comes from the places where these disagree.
 
+All the firmware is **bare metal**: plain C that writes the STM32's registers directly, using only the CMSIS register definitions. There is no HAL, no CubeMX and no generated code, so every line that touches the hardware is one you can look up in the reference manual. Each exercise has a complete program in [`firmware/`](firmware/); the snippets below are the important parts of it.
+
 ---
 
 ## Part 0: Setup (do this once)
@@ -25,17 +27,43 @@ The STM32 pins are **3.3 V logic**. The signal generator can easily produce volt
 4. Connect **one common ground**: board GND, scope probe ground, LA GND and the generator BNC shield.
 5. Don't connect the generator to a pin the firmware has configured as an **output**. Two outputs fighting each other can damage a pin. The 1 kΩ resistor helps here too.
 
-### 0.2 Software
+### 0.2 Software and documents
 
-- **STM32CubeIDE** (free, from ST). Create projects with **Board Selector → NUCLEO-F429ZI**. Accept "initialize peripherals to default mode": that sets up the clock at 180 MHz, the LEDs, the user button and USART3, which is the virtual COM port over the ST-LINK USB.
+- **`arm-none-eabi-gcc`** (Arm GNU Toolchain) and **`make`**.
+- **STM32CubeProgrammer**, for its command-line flasher `STM32_Programmer_CLI`. `openocd` or `st-flash` work too.
 - **KingstVIS** for the LA1010.
-- A serial terminal (PuTTY, screen, minicom, or the terminal built into CubeIDE) at **115200 baud** for `printf` output.
+- A serial terminal (PuTTY, screen, minicom) at **115200 baud** for `printf` output. The board's ST-LINK USB connection shows up as a serial port.
 
-*Alternative:* the Arduino IDE with the **STM32duino** core supports this board. The ideas carry over, but the snippets below use the ST HAL.
+Keep these PDFs from st.com open; the code comments point into them:
 
-### 0.3 Pin plan
+| Document | What's in it |
+|---|---|
+| **RM0090** (reference manual) | Every peripheral register and bit. The main reference. |
+| **DS9405** (STM32F429 datasheet) | Pin alternate-function table, electrical limits (V_IH / V_IL, rise times). |
+| **UM1974** (Nucleo-144 user manual) | Which board pins connect to what. |
+| **PM0214** (Cortex-M4 programming manual) | NVIC, SysTick, FPU, exceptions. |
 
-The Nucleo-144 board shares some pins with Ethernet, the ST-LINK, the LEDs and the button. This plan avoids those conflicts. **Double-check each pin against the board's pin labels in CubeMX or the board user manual (UM1974)** before wiring.
+### 0.3 Building and flashing
+
+From the `firmware/` folder:
+
+```sh
+make flash EX=07                         # build and flash exercise 7
+make flash EX=07 EXTRA_CFLAGS=-DSTEP=2   # pick a step inside an exercise
+make all                                 # build every exercise
+```
+
+Each exercise is one file, `firmware/exNN_*.c`, built together with:
+
+- `startup.c`: the vector table and the reset code (enable the FPU, copy initialised data to RAM, zero the rest, call `main`).
+- `linker.ld`: where flash and RAM are.
+- `common/`: the clock setup and the helpers in 0.5.
+
+See [`firmware/README.md`](firmware/README.md) for all the options.
+
+### 0.4 Pin plan
+
+The Nucleo-144 board shares some pins with Ethernet, the ST-LINK, the LEDs and the button. This plan avoids those conflicts. **Double-check each pin against the board user manual (UM1974)** before wiring.
 
 | Function | Pin | Notes |
 |---|---|---|
@@ -52,23 +80,38 @@ The Nucleo-144 board shares some pins with Ethernet, the ST-LINK, the LEDs and t
 
 **Avoid:** PA1, PA2, PA7, PB13, PC1, PC4, PC5, PG11, PG13 (Ethernet); PD8/PD9 (ST-LINK virtual COM); PA13/PA14 (SWD debug); PB0, PB7, PB14 (LEDs); PC13 (button); PH0/PH1 (the clock input from the ST-LINK).
 
-### 0.4 Two helpers you'll use everywhere
+### 0.5 The bare-metal pattern, and the helpers you'll use everywhere
 
-**Debug pins.** Toggling a GPIO is the fastest, least intrusive way to make firmware events visible on the LA or the scope. Writing to the BSRR register takes a single store instruction.
+Almost every peripheral is set up the same way:
+
+1. **Turn on its clock** in an `RCC->AHB1ENR`, `APB1ENR` or `APB2ENR` bit. Until you do, its registers ignore writes.
+2. **Give it its pins**: set each pin to *alternate function* mode and choose the AF number from the datasheet's alternate-function table.
+3. **Write its configuration registers**, then set its enable bit last.
+
+`common/gpio.h` has one-line helpers for step 2, because each pin's settings are 2- or 4-bit fields packed into shared registers:
 
 ```c
-#define DBG0_HI()  (GPIOG->BSRR = GPIO_PIN_2)
-#define DBG0_LO()  (GPIOG->BSRR = (uint32_t)GPIO_PIN_2 << 16)
-#define DBG1_HI()  (GPIOG->BSRR = GPIO_PIN_3)
-#define DBG1_LO()  (GPIOG->BSRR = (uint32_t)GPIO_PIN_3 << 16)
+gpio_mode(GPIOG, 0, GPIO_MODE_IN);      /* MODER:   input / output / alternate function / analog */
+gpio_speed(GPIOG, 2, GPIO_SPEED_HIGH);  /* OSPEEDR: output slew rate */
+gpio_pull(GPIOB, 8, GPIO_PULL_UP);      /* PUPDR:   internal pull-up / pull-down */
+gpio_af(GPIOD, 8, 7);                   /* AFR:     alternate function 7, and MODER = AF */
 ```
 
-Configure PG2/PG3 in CubeMX as `GPIO_Output`, **speed: Very High**.
-
-**Cycle counter.** The DWT unit counts CPU cycles; at 180 MHz one cycle is 5.56 ns.
+**Debug pins** (`common/dbg.h`). Toggling a GPIO is the fastest, least intrusive way to make firmware events visible on the LA or the scope. A write to the port's BSRR register sets or clears a pin in a single store instruction, without reading the port first:
 
 ```c
-static void dwt_init(void) {
+#define DBG0_HI()  (GPIOG->BSRR = GPIO_BSRR_BS2)
+#define DBG0_LO()  (GPIOG->BSRR = GPIO_BSRR_BR2)
+#define DBG1_HI()  (GPIOG->BSRR = GPIO_BSRR_BS3)
+#define DBG1_LO()  (GPIOG->BSRR = GPIO_BSRR_BR3)
+
+dbg_init(GPIO_SPEED_VERY_HIGH);   /* GPIOG clock on, PG2/PG3 as outputs */
+```
+
+**Cycle counter** (`common/dwt.h`). The DWT unit counts CPU cycles; at 180 MHz one cycle is 5.56 ns.
+
+```c
+static inline void dwt_init(void) {
   CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;
   DWT->CYCCNT = 0;
   DWT->CTRL |= DWT_CTRL_CYCCNTENA_Msk;
@@ -79,14 +122,19 @@ static inline void delay_cycles(uint32_t n) {
 }
 ```
 
-**printf over USB.** Add this to `main.c` so `printf` goes to the ST-LINK virtual COM port:
+**printf over USB** (`common/uart3.c`). `uart3_init(115200)` sets up USART3 on PD8/PD9, which the ST-LINK forwards to the PC. The C library calls `_write` for every `printf`; this one sends the bytes one at a time:
 
 ```c
 int _write(int fd, char *p, int len) {
-  HAL_UART_Transmit(&huart3, (uint8_t *)p, len, HAL_MAX_DELAY);
+  for (int i = 0; i < len; i++) {
+    while (!(USART3->SR & USART_SR_TXE)) {}   /* wait until the transmit register is empty */
+    USART3->DR = (uint8_t)p[i];
+  }
   return len;
 }
 ```
+
+**Clock** (`common/clock.c`). After reset the chip runs from its internal 16 MHz RC oscillator (HSI). `clock_init_180mhz()` switches to the full 180 MHz; you'll go through it in Exercise 4. Exercises 2 and 3 run on the 16 MHz HSI, and everything from Exercise 4 on runs at 180 MHz.
 
 ---
 
@@ -102,60 +150,95 @@ int _write(int fd, char *p, int len) {
 **Check:** The scope and the LA both report 10 kHz / 50%. The LA's resolution is 1 / sample rate (100 ns here). Is the difference between them smaller than that?
 
 ### Exercise 2: From Blinky to "how fast can a pin toggle?"
-**Goal:** See how much software overhead costs, and see aliasing in the LA.
+**Goal:** See how much each instruction costs, and see aliasing in the LA.
+**Firmware:** `ex02_toggle.c`, running on the 16 MHz HSI.
 
-1. **Step A:** blink LD1 (PB0) with `HAL_GPIO_TogglePin` + `HAL_Delay(100)`. Probe PB0 on the scope and LA. Is it exactly 5 Hz? (`HAL_Delay` adds an extra tick, so look carefully.)
-2. **Step B:** remove the delay and toggle DBG0 as fast as possible:
+1. **Step A** (`STEP=1`): blink LD1 (PB0) from the **SysTick** timer. SysTick is a 24-bit down-counter built into every Cortex-M core. Loaded with 16 000 at 16 MHz, it interrupts every 1 ms:
    ```c
-   while (1) { HAL_GPIO_TogglePin(GPIOG, GPIO_PIN_2); }
+   SysTick->LOAD = SystemCoreClock / 1000 - 1;
+   SysTick->VAL  = 0;
+   SysTick->CTRL = SysTick_CTRL_CLKSOURCE_Msk | SysTick_CTRL_TICKINT_Msk | SysTick_CTRL_ENABLE_Msk;
+
+   void SysTick_Handler(void) {
+     if (++ms_ticks % 100 == 0) GPIOB->ODR ^= GPIO_ODR_OD0;   /* toggle every 100 ms */
+   }
    ```
-   Measure the frequency on the scope.
-3. **Step C:** replace that with direct register writes:
+   Probe PB0 on the scope and LA. It should be 5 Hz. How close is it? The HSI is only accurate to about 1%; Exercise 4 measures it.
+2. **Step B** (`STEP=2`): toggle DBG0 as fast as possible by flipping the bit in the output register:
+   ```c
+   while (1) { GPIOG->ODR ^= GPIO_ODR_OD2; }
+   ```
+   That's a read, an XOR and a write per toggle. Measure the frequency on the scope.
+3. **Step C** (`STEP=3`): replace that with BSRR writes:
    ```c
    while (1) { DBG0_HI(); DBG0_LO(); }
    ```
-   Measure again. It should be many times faster. The pulse may also be *asymmetric*, because the loop branch adds time to only one half. Measure +width and −width on the scope.
+   Measure again. It should be noticeably faster. The pulse may also be *asymmetric*, because the loop branch adds time to only one half. Measure +width and −width on the scope. To see the actual instructions, run `arm-none-eabi-objdump -d build/ex02.elf` and find `main`.
 4. **Aliasing:** capture the Step C signal on the LA at 100, 50, 20, 10 and 5 MHz. Write down what frequency and duty cycle the LA *claims* at each rate.
 
-**Takeaway:** Sample a digital signal at **at least 4×, ideally 10×** its fastest frequency. When the LA is too slow it doesn't warn you; it just shows the wrong answer. The scope, at hundreds of MS/s, shows the truth.
+**Takeaway:** Sample a digital signal at **at least 4×, ideally 10×** its fastest frequency. When the LA is too slow it doesn't warn you; it just shows the wrong answer. The scope, at hundreds of MS/s, shows the truth. (Come back after Exercise 4 and add `clock_init_180mhz()` to Step C: the toggle gets much faster, though not the full 180 / 16 ≈ 11×, because of the flash wait states, and the LA's aliasing problem gets much worse.)
 
 ### Exercise 3: GPIO speed settings and edge rates
-**Goal:** Learn what the "GPIO speed" setting in CubeMX actually does.
+**Goal:** Learn what the OSPEEDR register actually does.
+**Firmware:** `ex03_edges.c`.
 
-1. Use the Step C toggle from Exercise 2, but slow it down with `delay_cycles(90)` in each half so you get a clean square wave of roughly 1 MHz.
-2. On the scope, measure **rise time** and **fall time** of DBG0 with the GPIO speed set to **Low**, then **Medium**, **High** and **Very High** (rebuild each time).
+1. The firmware makes a square wave on DBG0 with `delay_cycles(16)` in each half. Pick the output speed with `SPEED=0` (Low), `1` (Medium), `2` (High) or `3` (Very High):
+   ```c
+   gpio_speed(GPIOG, 2, SPEED);   /* OSPEEDR bits 5:4 for pin 2 */
+   ```
+2. On the scope, measure **rise time** and **fall time** of DBG0 for each speed setting.
 3. For the fastest settings, replace the probe's long ground clip with the short **ground spring**, and see how much the ringing changes.
 
-**Check:** Fast edges look great but cause ringing and EMI. Slow edges are cleaner but limit the maximum frequency. That's why the setting exists. Also note: your scope's bandwidth (150 MHz → about 2.3 ns rise time) sets a lower limit on what it can show.
+**Check:** The frequency stays the same for every setting: OSPEEDR changes only how hard the output driver switches, not the code's timing. Fast edges look great but cause ringing and EMI. Slow edges are cleaner but limit the maximum frequency. That's why the setting exists. Also note: your scope's bandwidth (150 MHz → about 2.3 ns rise time) sets a lower limit on what it can show.
 
-### Exercise 4: Look at the clock tree with MCO
-**Goal:** Verify the microcontroller's clock with an instrument instead of trusting the configuration.
+### Exercise 4: Bring up 180 MHz and check it with MCO
+**Goal:** Configure the clock tree yourself, then verify it with an instrument instead of trusting the code.
+**Firmware:** `ex04_mco.c` and `common/clock.c`.
 
-1. In CubeMX enable **RCC → MCO2** (PC9) with source **SYSCLK** and prescaler **/5**, giving 36 MHz:
+1. **Read `clock_init_180mhz()`** with RM0090 chapter 6 (RCC) open. It does seven things, in this order:
+   1. Start **HSE in bypass mode**: the ST-LINK feeds an 8 MHz clock into PH0, so there's no crystal to start (`HSEBYP`, then `HSEON`, wait for `HSERDY`).
+   2. Select **voltage scale 1** in the power controller (`PWR->CR VOS`). It's needed above 168 MHz.
+   3. Configure the **PLL**: 8 MHz / M=4 = 2 MHz, × N=180 = 360 MHz, / P=2 = **180 MHz**. Then set `PLLON`.
+   4. Enable **over-drive** (`ODEN`, wait `ODRDY`, then `ODSWEN`, wait `ODSWRDY`), which is also needed above 168 MHz.
+   5. Set **5 flash wait states**. Flash can't be read at 180 MHz in one cycle, and this must be set *before* the clock goes up.
+   6. Set the **bus prescalers**: AHB /1 = 180 MHz, APB1 /4 = 45 MHz, APB2 /2 = 90 MHz. Timers on a divided bus get twice the bus clock: 90 MHz on APB1, 180 MHz on APB2.
+   7. Wait for the PLL to lock, then **switch** the system clock to it (`SW`, then wait for `SWS` to confirm).
+
+   For each step, predict what goes wrong if you skip it. (Step 5 is the classic one: the CPU reads garbage from flash and crashes.)
+2. The firmware routes clocks to the MCO pins by writing `RCC->CFGR` **before** the PLL starts, because RM0090 warns that changing them later can glitch the output:
    ```c
-   HAL_RCC_MCOConfig(RCC_MCO2, RCC_MCO2SOURCE_SYSCLK, RCC_MCODIV_5);
+   RCC->CFGR = (RCC->CFGR & ~(RCC_CFGR_MCO1 | RCC_CFGR_MCO1PRE | RCC_CFGR_MCO2 | RCC_CFGR_MCO2PRE))
+             | RCC_CFGR_MCO1_1                   /* MCO1 = 10: HSE */
+             | (0UL << RCC_CFGR_MCO2_Pos)        /* MCO2 = 00: SYSCLK */
+             | (7UL << RCC_CFGR_MCO2PRE_Pos);    /* MCO2PRE = 111: divide by 5 */
+   clock_init_180mhz();
+   gpio_af(GPIOA, 8, 0);                         /* PA8 = MCO1 */
+   gpio_af(GPIOC, 9, 0);                         /* PC9 = MCO2 */
    ```
-2. Measure it on the scope's frequency counter. Then capture it on the LA at 100 MHz, and work out why the LA's reading isn't trustworthy (hint: Exercise 2).
-3. Enable **MCO1** (PA8) with source **HSE**, giving 8 MHz. On this board HSE comes from the ST-LINK's crystal. Then switch it to **HSI** (the internal RC oscillator, 16 MHz).
-4. Write down how far each one is from its nominal value, **in ppm** (parts per million): (measured − nominal) / nominal × 10⁶.
+3. Measure **MCO2 (PC9)** on the scope's frequency counter. **36 MHz means your 180 MHz setup works.** Then capture it on the LA at 100 MHz, and work out why the LA's reading isn't trustworthy (hint: Exercise 2).
+4. Measure **MCO1 (PA8)**, which is HSE: 8 MHz from the ST-LINK's crystal. Then rebuild with `EXTRA_CFLAGS=-DMCO1_HSI` to output the internal 16 MHz RC oscillator instead.
+5. Write down how far each one is from its nominal value, **in ppm** (parts per million): (measured − nominal) / nominal × 10⁶.
 
 **Takeaway:** A crystal is typically within ±50 ppm. HSI is specified to about ±1% (10 000 ppm). You'll see in Exercise 13 why that matters for UART.
 
 ### Exercise 5: Profiling code with debug pins
 **Goal:** Measure exactly how long a piece of code takes.
+**Firmware:** `ex05_profile.c`.
 
-1. Bracket some code with a debug pin:
+1. The firmware brackets some code with a debug pin, and times it with the cycle counter too:
    ```c
    volatile float x = 2.0f, y;
+   uint32_t t0 = DWT->CYCCNT;
    DBG0_HI();
    for (int i = 0; i < 100; i++) y = sqrtf(x + i);
    DBG0_LO();
+   uint32_t cycles = DWT->CYCCNT - t0;
    ```
 2. Measure the pulse width with the LA. Repeat at least 10 times and look at the variation.
-3. Compare: `sqrtf` (single precision, uses the FPU) vs `sqrt` (double precision; the M4's FPU is single precision only, so this runs in software). Also compare optimization levels `-O0` and `-O2`.
-4. Use DBG1 to mark a second region (e.g. a `printf`) and measure both on the same capture.
+3. Compare: `sqrtf` (`STEP=1`, single precision, uses the FPU) vs `sqrt` (`STEP=2`, double precision; the M4's FPU is single precision only, so this runs in software). Also compare optimization levels with `OPT=-O0` and the default `-O2`.
+4. DBG1 marks the `printf` that reports the cycle count. Measure both regions on the same capture.
 
-**Check:** Cross-check one measurement against `DWT->CYCCNT` printed over UART. Do the cycle count and the LA pulse width agree (cycles × 5.56 ns)?
+**Check:** Does the printed cycle count agree with the LA pulse width (cycles × 5.56 ns)? The `printf` takes far longer than the maths: count the characters and work out why, at 115200 baud.
 
 ---
 
@@ -163,11 +246,14 @@ int _write(int fd, char *p, int len) {
 
 ### Exercise 6: Measure the STM32's input thresholds and hysteresis
 **Goal:** Find out at what voltage the chip decides "0" or "1".
+**Firmware:** `ex06_threshold.c`.
 
-1. Configure **PG0 as an input** (no pull). The firmware copies it to DBG0 as fast as possible:
+1. **PG0 is an input** (no pull). The firmware copies it to DBG0 as fast as possible by reading the input data register:
    ```c
+   gpio_pull(GPIOG, 0, GPIO_PULL_NONE);
+   gpio_mode(GPIOG, 0, GPIO_MODE_IN);
    while (1) {
-     if (GPIOG->IDR & GPIO_PIN_0) DBG0_HI(); else DBG0_LO();
+     if (GPIOG->IDR & GPIO_IDR_ID0) DBG0_HI(); else DBG0_LO();
    }
    ```
 2. Generator: **triangle, 100 Hz, 0–3.3 V** → 1 kΩ → PG0.
@@ -179,30 +265,58 @@ int _write(int fd, char *p, int len) {
 
 ### Exercise 7: Interrupt latency and jitter
 **Goal:** Measure how quickly the CPU can respond to an external event.
+**Firmware:** `ex07_latency.c`.
 
-1. Configure **PG0 as EXTI, rising edge**, interrupt enabled in the NVIC. In the callback:
+1. Setting up a pin interrupt takes three blocks of hardware:
+   - **SYSCFG** chooses which port drives EXTI line 0 (all the pin-0s share one line).
+   - **EXTI** chooses the edge and unmasks the line.
+   - **NVIC** lets the interrupt reach the CPU.
    ```c
-   void HAL_GPIO_EXTI_Callback(uint16_t pin) {
-     if (pin == GPIO_PIN_0) { DBG0_HI(); DBG0_LO(); }
+   RCC->APB2ENR |= RCC_APB2ENR_SYSCFGEN;
+   SYSCFG->EXTICR[0] = (SYSCFG->EXTICR[0] & ~SYSCFG_EXTICR1_EXTI0) | SYSCFG_EXTICR1_EXTI0_PG;
+   EXTI->RTSR |= EXTI_RTSR_TR0;     /* rising edge */
+   EXTI->IMR  |= EXTI_IMR_MR0;      /* unmask line 0 */
+   NVIC_EnableIRQ(EXTI0_IRQn);
+
+   void EXTI0_IRQHandler(void) {    /* the name puts it in the vector table (startup.c) */
+     EXTI->PR = EXTI_PR_PR0;        /* clear the pending flag by writing 1 */
+     DBG0_HI();
+     DBG0_LO();
    }
    ```
 2. Generator: **square, 1 kHz, 0–3.3 V** → 1 kΩ → PG0.
 3. LA: CH0 = PG0, CH1 = DBG0, 100 MHz. Measure the delay from the input edge to the DBG0 pulse. Collect at least 20 samples and note the minimum, maximum and spread (**jitter**).
-4. Now write the handler yourself: put `EXTI->PR = EXTI_PR_PR0; DBG0_HI(); DBG0_LO();` directly in `EXTI0_IRQHandler` and skip the HAL. How much faster is it?
+4. **Sleeping vs spinning:** Step 1 (the default) leaves the main loop spinning. Rebuild with `STEP=2`, where the main loop sleeps in `__WFI()` (wait for interrupt) between edges. Does waking up from sleep add latency? Does the jitter change?
 5. Increase the generator frequency (10 kHz, 100 kHz, 500 kHz, 1 MHz…). Find where the LA shows **missed pulses** on DBG0.
-6. Add a busy loop (`delay_cycles(1800)` = 10 µs) to the main loop with interrupts disabled around it (`__disable_irq()` / `__enable_irq()`), and watch the worst-case latency grow.
+6. Rebuild with `STEP=3`: the main loop turns interrupts off for 10 µs at a time (`__disable_irq()`, `delay_cycles(1800)`, `__enable_irq()`). Watch the worst-case latency grow.
 
 **Takeaway:** The hardware minimum is about 12 cycles (≈ 67 ns), but real latency depends on the software around it. The LA is the only way to *see* the worst case.
 
 ### Exercise 8: Build a hardware frequency and duty-cycle meter (input capture)
 **Goal:** Let a timer measure the signal in hardware, and compare three instruments.
+**Firmware:** `ex08_capture.c`.
 
-1. Configure **TIM2** in **PWM Input** mode on CH1 (PA0): CH1 captures on the rising edge (period), CH2 captures on the falling edge of the same input (high time), and the slave mode resets the counter on TI1FP1. The timer clock is 90 MHz, so the resolution is 11.1 ns.
-2. Read and print:
+1. **TIM2** in *PWM input mode* (RM0090 "PWM input mode" in the TIM2–TIM5 chapter) uses two capture channels on the same pin, PA0 (AF1):
+   - **IC1** captures on the rising edge, giving the **period**.
+   - **IC2** captures on the falling edge, giving the **high time**.
+   - The **slave controller** resets the counter on every rising edge.
+
+   The timer clock is 90 MHz, so the resolution is 11.1 ns.
    ```c
-   uint32_t period = HAL_TIM_ReadCapturedValue(&htim2, TIM_CHANNEL_1) + 1;
-   uint32_t high   = HAL_TIM_ReadCapturedValue(&htim2, TIM_CHANNEL_2) + 1;
-   printf("f=%.3f Hz duty=%.2f%%\r\n", 90e6 / period, 100.0 * high / period);
+   TIM2->ARR   = 0xFFFFFFFF;
+   TIM2->CCMR1 = (1UL << TIM_CCMR1_CC1S_Pos)    /* CC1S = 01: IC1 from TI1 (PA0) */
+               | (2UL << TIM_CCMR1_CC2S_Pos);   /* CC2S = 10: IC2 also from TI1 */
+   TIM2->CCER  = TIM_CCER_CC2P                  /* IC2 on the falling edge */
+               | TIM_CCER_CC1E | TIM_CCER_CC2E;
+   TIM2->SMCR  = (5UL << TIM_SMCR_TS_Pos)       /* trigger = TI1FP1 */
+               | (4UL << TIM_SMCR_SMS_Pos);     /* slave mode = reset */
+   TIM2->CR1   = TIM_CR1_CEN;
+   ```
+2. The main loop reads the captures and prints them:
+   ```c
+   uint32_t period = TIM2->CCR1 + 1;
+   uint32_t high   = TIM2->CCR2 + 1;
+   printf("f=%.3f Hz duty=%.2f%%\r\n", (double)f_tim / period, 100.0 * high / period);
    ```
    (The `+1` follows the reset-on-edge convention. Check its effect at high frequencies.)
 3. Generator: square 0–3.3 V at 100 Hz, 10 kHz, 1 MHz, and as high as it will go. Change the duty cycle too.
@@ -216,23 +330,36 @@ int _write(int fd, char *p, int len) {
 
 ### Exercise 9: ADC → DAC passthrough and aliasing you can see
 **Goal:** Watch sampling theory happen on the scope screen.
+**Firmware:** `ex09_adc_dac.c`.
 
-1. Configure **TIM3** with TRGO = Update at **10 kHz**. **ADC1 IN3 (PA3)**: external trigger *Timer 3 Trigger Out*, conversion-complete interrupt on, sampling time 56 cycles or more. **DAC channel 1 (PA4)** with the output buffer on.
-2. In the callback, copy each sample straight to the DAC and mark it with a debug pin:
+1. Here three peripherals are chained in hardware:
+   - **TIM3** overflows at **10 kHz** and sends a trigger pulse (TRGO) on each overflow.
+   - That pulse starts an **ADC1** conversion of IN3 (PA3).
+   - The end-of-conversion interrupt writes the sample to **DAC channel 1** (PA4).
    ```c
-   void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef *h) {
+   ADC->CCR    = ADC_CCR_ADCPRE_0;                 /* ADC clock = 90 MHz / 4 = 22.5 MHz */
+   ADC1->SMPR2 = 3UL << ADC_SMPR2_SMP3_Pos;        /* 56-cycle sampling time on channel 3 */
+   ADC1->SQR3  = 3UL << ADC_SQR3_SQ1_Pos;          /* convert channel 3 */
+   ADC1->CR1   = ADC_CR1_EOCIE;                    /* interrupt at end of conversion */
+   ADC1->CR2   = ADC_CR2_EXTEN_0                   /* start on a rising trigger edge... */
+               | (8UL << ADC_CR2_EXTSEL_Pos)       /* ...from TIM3 TRGO (EXTSEL = 1000) */
+               | ADC_CR2_ADON;
+   TIM3->ARR = 8999;                               /* 90 MHz / 9000 = 10 kHz */
+   TIM3->CR2 = 2UL << TIM_CR2_MMS_Pos;             /* TRGO on each update */
+
+   void ADC_IRQHandler(void) {
      DBG0_HI();
-     HAL_DAC_SetValue(&hdac, DAC_CHANNEL_1, DAC_ALIGN_12B_R, HAL_ADC_GetValue(h));
+     DAC1->DHR12R1 = ADC1->DR;                     /* 12-bit sample straight to the DAC */
      DBG0_LO();
    }
    ```
-3. Generator: **sine, 0.3–3.0 V** (2.7 Vpp, 1.65 V offset) → 1 kΩ → PA3. Scope CH1 = generator, CH2 = DAC output (PA4).
-4. Sweep the generator: 100 Hz, 1 kHz, 4 kHz, 5 kHz, **9 kHz, 9.9 kHz, 11 kHz**.
+2. Generator: **sine, 0.3–3.0 V** (2.7 Vpp, 1.65 V offset) → 1 kΩ → PA3. Scope CH1 = generator, CH2 = DAC output (PA4).
+3. Sweep the generator: 100 Hz, 1 kHz, 4 kHz, 5 kHz, **9 kHz, 9.9 kHz, 11 kHz**.
 
 **What you should see:** At 100 Hz the output is a staircase copy of the input. At 9 kHz the DAC output looks like a clean **1 kHz** sine. That's aliasing: a frequency that doesn't exist in the input. At 9.9 kHz you get 100 Hz. At exactly 5 kHz (Nyquist) the result depends on the phase.
 
-5. LA: CH0 = DBG0. Confirm the sample rate really is 10 kHz, and measure how much of each 100 µs sample period the callback uses.
-6. Change the ADC sampling time and the input resistor (1 kΩ → 47 kΩ). What happens to accuracy? (The sampling capacitor needs time to charge through the source resistance.)
+4. LA: CH0 = DBG0. Confirm the sample rate really is 10 kHz, and measure how much of each 100 µs sample period the interrupt handler uses.
+5. Change the ADC sampling time (`SMP=0` is 3 cycles, `SMP=7` is 480) and the input resistor (1 kΩ → 47 kΩ). What happens to accuracy? (The sampling capacitor needs time to charge through the source resistance.)
 
 ---
 
@@ -240,13 +367,29 @@ int _write(int fd, char *p, int len) {
 
 ### Exercise 10: DAC waveform generator + RC reconstruction filter
 **Goal:** Build a simple signal generator and compare it with the real one.
+**Firmware:** `ex10_dac_dma.c`.
 
-1. Make a 64-point sine look-up table (`uint16_t lut[64]`, values 0–4095). Configure **TIM6** TRGO = Update and **DAC1** trigger = *Timer 6 Trigger Out*, with DMA in **circular** mode, half-word:
+1. The setup has four parts:
+   - The firmware fills a 64-point sine table.
+   - **TIM6** sends a trigger 64 000 times a second.
+   - Each trigger makes the **DAC** ask for its next sample.
+   - **DMA1 Stream 5 Channel 7** copies the next table entry into the DAC, wrapping around at the end (circular mode).
+
+   Once it's started, the CPU does nothing at all.
    ```c
-   HAL_TIM_Base_Start(&htim6);
-   HAL_DAC_Start_DMA(&hdac, DAC_CHANNEL_1, (uint32_t *)lut, 64, DAC_ALIGN_12B_R);
+   DMA1_Stream5->PAR  = (uint32_t)&DAC1->DHR12R1;    /* to: the DAC's data register */
+   DMA1_Stream5->M0AR = (uint32_t)lut;               /* from: the table */
+   DMA1_Stream5->NDTR = 64;
+   DMA1_Stream5->CR   = (7UL << DMA_SxCR_CHSEL_Pos)  /* channel 7 = DAC1 request */
+                      | DMA_SxCR_MSIZE_1 | DMA_SxCR_PSIZE_1   /* 32-bit transfers */
+                      | DMA_SxCR_MINC | DMA_SxCR_CIRC
+                      | DMA_SxCR_DIR_0                /* memory to peripheral */
+                      | DMA_SxCR_EN;
+   DAC1->CR  = DAC_CR_TEN1 | DAC_CR_DMAEN1 | DAC_CR_EN1;   /* trigger TSEL1 = 000: TIM6 */
+   TIM6->CR2 = 2UL << TIM_CR2_MMS_Pos;                     /* TRGO on update */
+   TIM6->CR1 = TIM_CR1_CEN;
    ```
-   With 64 points and TIM6 at 64 kHz you get a 1 kHz sine. Zero CPU time is used once it's running.
+   90 MHz / 64 kHz = 1406.25 isn't a whole number, so the firmware rounds and prints the frequency you actually get (about 1000.2 Hz). Pick another with `SINE_HZ=2000`.
 2. Scope CH1 = PA4 (the MCU sine), CH2 = the Hantek generator's 1 kHz sine. Zoom in on the MCU's **staircase**.
 3. Add an **RC low-pass filter** on PA4: 1 kΩ in series, then 100 nF to GND (cutoff ≈ 1.6 kHz). Do the steps disappear? What happens to the amplitude and phase? Try 10 nF (cutoff ≈ 16 kHz) instead.
 4. Use the scope's **FFT** (if available) on both signals and compare the harmonics with the Hantek AWG's.
@@ -255,24 +398,34 @@ int _write(int fd, char *p, int len) {
 
 ### Exercise 11: Complementary PWM with dead time
 **Goal:** Measure a timing detail that matters in motor drivers and power supplies.
+**Firmware:** `ex11_deadtime.c`.
 
-1. Configure **TIM1 CH1 + CH1N** (PE9 / PE8) for PWM at **100 kHz, 30% duty**. The TIM1 clock is 180 MHz, so use ARR = 1799 and CCR1 = 540.
-2. Set **dead time** (DTG) to 0, then 18, then 90. In this range one DTG step is 1 / 180 MHz = 5.56 ns.
-3. Start both outputs:
+1. **TIM1 CH1 + CH1N** (PE9 / PE8, AF1) make PWM at **100 kHz, 30% duty**. TIM1 runs at 180 MHz:
    ```c
-   HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_1);
-   HAL_TIMEx_PWMN_Start(&htim1, TIM_CHANNEL_1);
+   TIM1->ARR   = 1799;                            /* 180 MHz / 1800 = 100 kHz */
+   TIM1->CCR1  = 540;                             /* 540 / 1800 = 30% */
+   TIM1->CCMR1 = (6UL << TIM_CCMR1_OC1M_Pos)      /* PWM mode 1 */
+               | TIM_CCMR1_OC1PE;
+   TIM1->CCER  = TIM_CCER_CC1E | TIM_CCER_CC1NE;  /* CH1 and its complement */
+   TIM1->BDTR  = (DTG << TIM_BDTR_DTG_Pos)        /* dead time */
+               | TIM_BDTR_MOE;                    /* main output enable */
+   TIM1->EGR   = TIM_EGR_UG;
+   TIM1->CR1   = TIM_CR1_ARPE | TIM_CR1_CEN;
    ```
-4. LA CH0 = CH1, CH1 = CH1N at 100 MHz: measure the gap where **both are low**. Then measure the same gap on the scope (CH1 and CH2) with cursors.
+   TIM1 is an *advanced* timer: its outputs stay off until you set **MOE**, a safety feature for power stages.
+2. Set **dead time** with `DTG=0` (default), then `DTG=18`, then `DTG=90`. In this range one DTG step is 1 / 180 MHz = 5.56 ns.
+3. LA CH0 = CH1, CH1 = CH1N at 100 MHz: measure the gap where **both are low**. Then measure the same gap on the scope (CH1 and CH2) with cursors.
 
 **Check:** With DTG = 18 you expect 100 ns. The LA can only resolve 10 ns steps; the scope can do better. Which one would you trust for a 20 ns dead time?
 
 ### Exercise 12: Glitch hunting with triggers
 **Goal:** Catch a rare, wrong event, which is what most real debugging looks like.
+**Firmware:** `ex12_glitch.c`.
 
 1. The firmware makes a stream of 10 µs pulses, but every 1000th pulse is only 1 µs long:
    ```c
    for (uint32_t n = 0;; n++) {
+     if (n % 1000 == 0) { DBG1_HI(); DBG1_LO(); }   /* marker */
      DBG0_HI();
      delay_cycles((n % 1000 == 999) ? 180 : 1800);
      DBG0_LO();
@@ -280,32 +433,79 @@ int _write(int fd, char *p, int len) {
    }
    ```
 2. On the scope, just looking at the signal, the glitch is nearly invisible. Set up a **pulse-width trigger**: positive pulse **< 5 µs**. Now the scope shows only the glitch.
-3. Do the same in KingstVIS with a **pulse-width trigger** on CH0. Use DBG1 to mark when `n % 1000 == 0`, and check how many pulses lie between the marker and the glitch.
-4. Make it harder: change the glitch to once every 100 000 pulses, or shorten it to 100 ns. Can both instruments still catch it?
+3. Do the same in KingstVIS with a **pulse-width trigger** on CH0. DBG1 marks the start of each group of 1000: check how many pulses lie between the marker and the glitch.
+4. Make it harder: `EXTRA_CFLAGS="-DGLITCH_EVERY=100000"` for a rarer glitch, or `-DGLITCH_CYCLES=18` for a 100 ns one. Can both instruments still catch it?
 
 ---
 
 ## Level 4: Protocols (the payoff)
 
 ### Exercise 13: UART: decoding, baud-rate error and clock accuracy
-1. Configure **USART6** (TX = PG14) at **115200 8N1**. Send `"Hello\r\n"` every 100 ms.
+**Firmware:** `ex13_uart.c`.
+
+1. **USART6** (TX = PG14, RX = PG9, AF8) runs at **115200 8N1** and sends `"Hello\r\n"` every 100 ms. The baud rate comes from one division of the bus clock:
+   ```c
+   USART6->BRR = (clock_apb2_hz() + baud / 2) / baud;   /* 90 MHz / 115200 = 781.25 -> 781 */
+   USART6->CR1 = USART_CR1_UE | USART_CR1_TE | USART_CR1_RE;
+
+   while (!(USART6->SR & USART_SR_TXE)) {}   /* per character */
+   USART6->DR = c;
+   ```
+   The rounding from 781.25 to 781 is itself a baud-rate error. Work it out in %.
 2. LA CH0 = PG14 with KingstVIS's **Async Serial** decoder at 115200 8N1. You should see the text decoded above the waveform.
 3. Scope: measure one bit width (expected 1 / 115200 = **8.68 µs**). Check the levels and the idle state (high).
 4. Set the decoder to the **wrong baud rate** (57600, 230400) and look at the garbage, including framing errors.
-5. **Clock experiment:** switch the system clock source from HSE (crystal) to **HSI**, then use the HSI trim bits (`__HAL_RCC_HSI_CALIBRATIONVALUE_ADJUST`) to deliberately make it 2–3% off. Measure the actual bit width with the LA. At what error does the decoder (or a real receiver) start failing? UART typically tolerates about ±2–3% in total.
+5. **Clock experiment:** rebuild with `EXTRA_CFLAGS="-DSTEP=2 -DHSI_TRIM=16"`. The firmware now skips `clock_init_180mhz()` and runs everything from the HSI, with its trim bits set:
+   ```c
+   RCC->CR = (RCC->CR & ~RCC_CR_HSITRIM) | (HSI_TRIM << RCC_CR_HSITRIM_Pos);   /* 0-31, reset value 16 */
+   ```
+   Change `HSI_TRIM` step by step (try 20, 24, 28, then 12, 8, 4) and measure the actual bit width with the LA each time. At what error does the decoder (or a real receiver) start failing? UART typically tolerates about ±2–3% in total. The `printf` output on the ST-LINK port is detuned too, so it may fail at the same point.
 
 ### Exercise 14: SPI: clock modes and loopback
-1. Configure **SPI4** as master: SCK = PE2, MOSI = PE6, MISO = PE5, a software NSS on PE4. Connect **MOSI to MISO** with a jumper (loopback). Send `0xA5, 0x3C, 0x00, 0xFF` repeatedly at about 1 MHz.
+**Firmware:** `ex14_spi.c`.
+
+1. **SPI4** is the master: SCK = PE2, MISO = PE5, MOSI = PE6 (all AF5), with NSS on PE4 driven as an ordinary output. Connect **MOSI to MISO** with a jumper (loopback). The firmware sends `0xA5, 0x3C, 0x00, 0xFF` every 100 µs and counts frames where what came back doesn't match:
+   ```c
+   SPI4->CR1 = SPI_CR1_MSTR | SPI_CR1_SSM | SPI_CR1_SSI   /* master, NSS handled in software */
+             | (BR << SPI_CR1_BR_Pos)                     /* SCK = 90 MHz / 2^(BR+1) */
+             | (CPOL ? SPI_CR1_CPOL : 0) | (CPHA ? SPI_CR1_CPHA : 0);
+   SPI4->CR1 |= SPI_CR1_SPE;
+
+   static uint8_t spi4_transfer(uint8_t out) {
+     while (!(SPI4->SR & SPI_SR_TXE)) {}
+     SPI4->DR = out;
+     while (!(SPI4->SR & SPI_SR_RXNE)) {}   /* SPI always receives while it sends */
+     return SPI4->DR;
+   }
+   ```
+   The default `BR=5` gives 1.41 MHz.
 2. LA: CH0 = SCK, CH1 = MOSI, CH2 = MISO, CH3 = NSS. Add an **SPI decoder**. Check that the MISO bytes match the MOSI bytes.
-3. Change the firmware's **CPOL/CPHA** through all four modes. Keep the decoder on mode 0 and see which modes decode wrongly. Then fix the decoder settings.
-4. Increase the SPI clock with the prescaler (up to 45 MHz). Find where the **LA** stops decoding correctly (hint: sample rate), and where the **scope** shows that the SCK edges are no longer square.
+3. Change the firmware's clock mode with `SPI_MODE=0` to `3` (CPOL is bit 1, CPHA bit 0). Keep the decoder on mode 0 and see which modes decode wrongly. Then fix the decoder settings.
+4. Increase the SPI clock with `BR=4`, `3`, … down to `0` (45 MHz). Find where the **LA** stops decoding correctly (hint: sample rate), and where the **scope** shows that the SCK edges are no longer square. Does the loopback error count stay at zero?
 
 ### Exercise 15: I²C: ACK/NACK and pull-up resistors
-1. Configure **I2C1** (SCL = PB8, SDA = PB9) at 100 kHz. Scan addresses 0x08–0x77 with `HAL_I2C_IsDeviceReady()` and print the results. Run it with **no device connected** first.
-2. LA: CH0 = SCL, CH1 = SDA, with the **I²C decoder**. Find the address byte and the **NACK**.
-3. **Pull-ups:** with only the STM32's internal pull-ups (about 40 kΩ), look at SDA's rising edges on the scope. They are slow, RC-shaped ramps, because I²C is open-drain. Now add external **4.7 kΩ** pull-ups to 3.3 V and compare.
-4. Fault injection: change to **400 kHz**, use a weak pull-up (47 kΩ) and/or add **1 nF** from SDA to GND. On the scope measure the rise time. Raise it until the LA decoder (or the MCU itself) starts reporting errors. The I²C spec allows a maximum 1000 ns rise time at 100 kHz and 300 ns at 400 kHz.
-5. If you have any I²C sensor, connect it and decode a real register read: address + W, register, repeated START, address + R, data.
+**Firmware:** `ex15_i2c.c`.
+
+1. **I2C1** (SCL = PB8, SDA = PB9, AF4) runs at 100 kHz. The pins must be **open-drain**: I²C devices only ever pull the lines low, and resistors pull them high. The firmware scans addresses 0x08–0x77 once a second and prints the ones that answer. Run it with **no device connected** first.
+
+   The STM32F4's I²C peripheral is driven step by step through status flags. To probe one address:
+   ```c
+   I2C1->CR1 |= I2C_CR1_START;               /* 1. send START...          */
+   wait for SR1.SB;                          /*    ...and wait until sent */
+   I2C1->DR = addr << 1;                     /* 2. send address + write   */
+   wait for SR1.ADDR (ACK) or SR1.AF (NACK); /* 3. did anyone answer?     */
+   if ACK: read SR1 then SR2;                /*    this clears ADDR       */
+   I2C1->CR1 |= I2C_CR1_STOP;                /* 4. send STOP              */
+   ```
+   The timing comes from the APB1 clock: `CR2 FREQ = 45` (MHz), `CCR = 45 MHz / (2 × 100 kHz) = 225`, `TRISE = 46`.
+2. LA: CH0 = SCL, CH1 = SDA, with the **I²C decoder**. DBG0 is high during each scan, so you can trigger on it. Find the address byte and the **NACK**.
+3. **Pull-ups:** by default the firmware turns on the STM32's internal pull-ups (about 40 kΩ). Look at SDA's rising edges on the scope. They are slow, RC-shaped ramps, because the lines are open-drain. Now add external **4.7 kΩ** pull-ups to 3.3 V, rebuild with `INTERNAL_PULLUPS=0`, and compare.
+4. Fault injection: rebuild with `-DI2C_FAST` for **400 kHz**, use a weak pull-up (47 kΩ) and/or add **1 nF** from SDA to GND. On the scope measure the rise time. Raise it until the LA decoder (or the MCU itself) starts reporting errors. The I²C spec allows a maximum 1000 ns rise time at 100 kHz and 300 ns at 400 kHz. Try it with *no* pull-ups at all: the lines float, and the firmware may report the bus as busy or every probe as a timeout. Why?
+5. If you have any I²C sensor, connect it and read one of its registers, for example a BME280's ID register:
+   ```sh
+   make flash EX=15 EXTRA_CFLAGS="-DSENSOR_ADDR=0x76 -DSENSOR_REG=0xD0"
+   ```
+   Decode it on the LA: address + W, register, repeated START, address + R, data, NACK, STOP. Then find in `i2c1_read_reg()` the code that makes each part happen.
 
 ---
 
