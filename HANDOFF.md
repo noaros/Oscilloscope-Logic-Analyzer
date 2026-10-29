@@ -12,11 +12,20 @@ Context for whoever picks this up next (human or Claude Code session).
 - Pin plan, safety rules and helpers (debug pins, DWT cycle counter, printf) are in Part 0 of that file.
 
 ## Next task: convert the exercises to bare metal (register level, no HAL)
-The user asked for this. Plan:
+The user asked for this.
+
+### Progress (2026-10-29)
+- Step 1 skeleton is done and builds clean with `make all` (arm-none-eabi-gcc 15.3): `Makefile`, `linker.ld`, `startup.c`, `common/` (clock, dbg, dwt, uart3, gpio helpers, syscalls). CMSIS headers are **vendored** (copied, not submodules) in `firmware/cmsis/`.
+- Exercise programs written so far: `ex02_toggle.c` (STEP 1-3), `ex04_mco.c` (also verifies `clock_init_180mhz()`).
+- Not yet run on hardware.
+- Remaining: ex03 and ex05-ex15 sources, then step 2 (rewrite the snippets in `EXERCISES.md`).
+- Makefile conventions: pick a step with `EXTRA_CFLAGS=-DSTEP=n`, optimisation with `OPT=`, flasher with `FLASH_TOOL=cubeprog|openocd|stflash`.
+
+### Plan
 
 1. **Add a buildable `firmware/` skeleton:**
    - Toolchain: `arm-none-eabi-gcc` + Makefile.
-   - CMSIS device headers from ST's `cmsis-device-f4` and the core headers from ARM `CMSIS_5`. Add them as git submodules, or vendor only the needed headers.
+   - CMSIS device headers from ST's `cmsis-device-f4` and the core headers from ARM `CMSIS_5`. Vendored: only the needed headers are copied.
    - Write our own `linker.ld` (2 MB flash @ 0x08000000, 192 KB SRAM @ 0x20000000, 64 KB CCM) and `startup.c` (vector table + Reset_Handler: copy `.data`, zero `.bss`, enable the FPU through `SCB->CPACR`, call `main`).
    - `common/`:
      - `clock.c`: 180 MHz setup. HSE bypass (`HSEON` | `HSEBYP`), PLL M=4 N=180 P=2 Q=8 (Q only matters for USB), `PWREN`, VOS scale 1, over-drive enable + switch (`ODEN`, then `ODSWEN`), `FLASH->ACR` LATENCY=5 + prefetch/ICEN/DCEN, AHB /1, APB1 /4 (45 MHz, timer clock 90 MHz), APB2 /2 (90 MHz, timer clock 180 MHz).
@@ -30,4 +39,4 @@ The user asked for this. Plan:
 4. Keep the existing pin plan, safety section, logbook template and tone. Update the README to mention the firmware folder.
 
 ## Branch
-Work happens on `claude/sweet-tesla-tzl9qa`.
+Work happens on `main` (the earlier `claude/sweet-tesla-tzl9qa` branch was merged and deleted).
