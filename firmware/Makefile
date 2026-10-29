@@ -1,4 +1,4 @@
-# Bare-metal firmware for the exercises in ../EXERCISES.md (Nucleo-F429ZI).
+# Bare-metal firmware for the exercises in ../README.md (Nucleo-F429ZI).
 #
 #   make EX=07           build exercise 7 -> build/ex07.elf and build/ex07.bin
 #   make flash EX=07     build it and flash it through the board's ST-LINK

@@ -8,7 +8,7 @@ Context for whoever picks this up next (human or Claude Code session).
 - Nucleo-F429ZI: STM32F429ZI, 180 MHz Cortex-M4F. The ST-LINK provides an 8 MHz clock to HSE (bypass mode) and a virtual COM port on USART3 (PD8/PD9).
 
 ## Done
-- `EXERCISES.md` has 15 exercises plus capstones. The Nucleo is the device under test, and all code is bare metal (CMSIS register definitions only, no HAL).
+- The exercises are in `README.md` (moved from `EXERCISES.md`): 15 exercises plus capstones. The Nucleo is the device under test, and all code is bare metal (CMSIS register definitions only, no HAL).
 - Pin plan, safety rules and helpers (debug pins, DWT cycle counter, printf) are in Part 0 of that file.
 
 ## Next task: convert the exercises to bare metal (register level, no HAL)
@@ -19,7 +19,7 @@ The user asked for this.
 - All exercise programs are written: `ex02`-`ex15` (exercise 1 needs no firmware). `make all` builds them all with no warnings, and every documented option (`STEP`, `SPEED`, `SMP`, `SINE_HZ`, `DTG`, `GLITCH_*`, `HSI_TRIM`, `SPI_MODE`, `BR`, `I2C_FAST`, `INTERNAL_PULLUPS`, `SENSOR_ADDR/REG`) was compile-checked. Key bitfield values were checked against RM0090 encodings.
 - Not yet run on hardware. Flash `ex04` first: PC9 should read 36 MHz, which confirms `clock_init_180mhz()`.
 - Design notes: ex02 Step A blinks from a SysTick interrupt; ex07 compares spinning / `__WFI()` sleep / interrupts-off (STEP 1-3); ex10's table is `uint32_t` so the DMA does word writes to DHR12R1, and 1 kHz is rounded (ARR 1405, printed at startup); ex03 and ex02 run on the 16 MHz HSI.
-- Step 2 is done: `EXERCISES.md` is fully bare metal, with snippets taken from the `firmware/` files. No HAL or CubeMX anywhere.
+- Step 2 is done: the exercise guide (now in `README.md`) is fully bare metal, with snippets taken from the `firmware/` files. No HAL or CubeMX anywhere.
 - Makefile conventions: pick a step with `EXTRA_CFLAGS=-DSTEP=n`, optimisation with `OPT=`, flasher with `FLASH_TOOL=cubeprog|openocd|stflash`.
 
 ### Plan
